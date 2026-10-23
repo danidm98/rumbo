@@ -10,6 +10,7 @@ panel: series diarias, aportado, plusvalias, TIR, rentabilidad por ano...
 Lo llama el servidor (servidor.py); no hace falta ejecutarlo a mano.
 """
 
+import bisect
 import json
 import math
 import os
@@ -103,10 +104,54 @@ def r4(x):
 
 # ---------------------------------------------------------------- Yahoo
 
+def _base_cache(simbolo, cache=None):
+    """Ruta en la cache, sin extensión, de los ficheros de un símbolo de Yahoo."""
+    return os.path.join(cache or CACHE, re.sub(r"[^A-Za-z0-9._-]", "_", simbolo))
+
+
+def splits_de(simbolo, cache=None):
+    """{fecha_iso: proporción} de los splits que Yahoo ha dado para el símbolo (25.0 = 25 por 1)."""
+    return lee_cache(_base_cache(simbolo, cache) + ".splits.json")
+
+
+def _cache_reajustada(previo, nuevo, splits_nuevos):
+    """
+    True si Yahoo ha reajustado el histórico y todo lo guardado antes ya no vale.
+    Yahoo no siempre manda el evento del split (SPYI.DE no lo trae), pero sí da
+    los cierres de antes ajustados; por eso se mira también si los precios cuadran.
+    """
+    # 1. Un split que no se conocía: Yahoo ha reajustado la serie entera.
+    if splits_nuevos:
+        return True
+    # 2. Fechas guardadas y descargadas a la vez: si la mediana del cociente se va
+    #    más de un 5 % de 1, lo guardado está en otra escala.
+    cocientes = sorted(nuevo[k] / previo[k] for k in set(previo) & set(nuevo)
+                       if previo[k] > 0 and nuevo[k] > 0)
+    if cocientes:
+        n = len(cocientes)
+        mediana = cocientes[n // 2] if n % 2 else (cocientes[n // 2 - 1] + cocientes[n // 2]) / 2
+        if not 1 / 1.05 <= mediana <= 1.05:
+            return True
+    # 3. Unión entre el último cierre guardado anterior a la descarga y el primero
+    #    nuevo: si están a pocos días y saltan como un split (x1,8 o más, en cualquier
+    #    sentido), lo guardado está sin ajustar. Con huecos largos no se compara:
+    #    en años el precio puede haber cambiado mucho sin ningún split.
+    primera = min(nuevo)
+    anteriores = [k for k, v in previo.items() if k < primera and v > 0]
+    if anteriores and nuevo[primera] > 0:
+        ultima = max(anteriores)
+        dias = (dt.date.fromisoformat(primera) - dt.date.fromisoformat(ultima)).days
+        salto = nuevo[primera] / previo[ultima]
+        if dias <= 10 and not 1 / 1.8 < salto < 1.8:
+            return True
+    return False
+
+
 def descargar_serie(simbolo, anos=None):
     """Devuelve {fecha_iso: cierre} descargando de Yahoo, con cache en disco."""
     os.makedirs(CACHE, exist_ok=True)
-    ruta = os.path.join(CACHE, re.sub(r"[^A-Za-z0-9._-]", "_", simbolo) + ".json")
+    ruta = _base_cache(simbolo) + ".json"
+    ruta_splits = _base_cache(simbolo) + ".splits.json"
     previo = lee_cache(ruta)
     if SIN_RED or (SOLO_FALTAN and previo):
         return previo
@@ -115,7 +160,8 @@ def descargar_serie(simbolo, anos=None):
     # o al trimestre aunque se le pida interval=1d.
     desde = int(time.time()) - anos * 365 * 86400 if anos else 0
     url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
-           f"{urllib.parse.quote(simbolo)}?period1={desde}&period2={int(time.time())}&interval=1d")
+           f"{urllib.parse.quote(simbolo)}?period1={desde}&period2={int(time.time())}"
+           "&interval=1d&events=split")
     try:
         with red.abrir(url, UA, timeout=30) as resp:
             bruto = json.loads(resp.read().decode("utf-8", "replace"))
@@ -129,13 +175,28 @@ def descargar_serie(simbolo, anos=None):
         for ts, c in zip(res.get("timestamp", []), cierres):
             if c is not None:
                 nuevo[dt.date.fromtimestamp(ts).isoformat()] = float(c)
+        # Yahoo da los cierres ya ajustados por splits, también los anteriores al split.
+        splits = {}
+        for sp in ((res.get("events") or {}).get("splits") or {}).values():
+            try:
+                if sp["denominator"] and sp["numerator"]:
+                    splits[dt.date.fromtimestamp(sp["date"]).isoformat()] = sp["numerator"] / sp["denominator"]
+            except (KeyError, TypeError):
+                pass
         if nuevo:
+            conocidos = lee_cache(ruta_splits)
+            if previo and _cache_reajustada(previo, nuevo, set(splits) - set(conocidos)):
+                # Un split reajusta toda la serie: lo guardado antes está sin ajustar.
+                print(f"  ..  {simbolo}: Yahoo ha reajustado el histórico (¿split?); descarto lo guardado")
+                previo = {}
             # Lo descargado sustituye a lo guardado en ese tramo de fechas: así se limpian
             # los datos mensuales que dejó en la cache la versión 1.1.0.
             previo = {k: v for k, v in previo.items() if k < min(nuevo)}
             previo.update(nuevo)
             with open(ruta, "w", encoding="utf-8") as f:
                 json.dump(previo, f)
+            # Se suman a los ya conocidos: una descarga de pocos años no trae los splits antiguos.
+            guarda_cache(ruta_splits, {**conocidos, **splits})
             print(f"  OK  {simbolo:16s} {len(nuevo):5d} sesiones  "
                   f"ultimo {sorted(nuevo)[-1]} = {nuevo[sorted(nuevo)[-1]]:.4f}")
         else:
@@ -584,6 +645,293 @@ def expande_traspasos(movimientos):
     return out
 
 
+def _factor_splits(splits, desde, hasta=None):
+    """Lo que se multiplican las participaciones por los splits de después de 'desde'
+    (y hasta 'hasta' incluido, si se da). La fecha del split es la del primer día que
+    cotiza con las participaciones nuevas: lo de ese mismo día ya va en las nuevas."""
+    factor = 1.0
+    for f, r in splits.items():
+        if f > desde and (hasta is None or f <= hasta):
+            factor *= r
+    return factor
+
+
+def _cierre_cercano(cierres, fechas, fecha):
+    """El cierre del día o el último anterior; si no hay ninguno antes, el primero después."""
+    i = bisect.bisect_right(fechas, fecha)
+    if i:
+        return cierres[fechas[i - 1]]
+    return cierres[fechas[0]] if fechas else None
+
+
+# Proporciones de split que se aceptan al deducirlas del precio (y sus inversas, los contrasplits).
+SPLITS_PLAUSIBLES = (2, 3, 4, 5, 8, 10, 15, 20, 25, 30, 40, 50, 100)
+_MISMO_PRECIO = math.log(1.5)   # |log(precio / cierre)| menor: el mismo precio (cambio, comisiones, horquilla)
+_ENCAJA = math.log(1.10)        # lo que puede separarse de una proporción para darla por buena
+# Movimientos con un precio que se pueda comparar con el cierre (el ajuste no lo tiene).
+_CON_PRECIO = ("compra", "venta", "traspaso", "traspaso_salida", "traspaso_entrada")
+
+
+def _proporcion_split(r, yahoo=1.0):
+    """
+    El split que explica que un movimiento salga a 'r' veces el cierre ajustado de ese día:
+    1.0 si es el mismo precio, la proporción plausible más cercana (25.0 = 25 por 1) o None
+    si no encaja con ninguna. 'yahoo' es lo que dan los splits de Yahoo posteriores a la
+    fecha: si el precio cuadra con eso, vale aunque no esté en la lista (3 por 2).
+    """
+    lr = math.log(r)
+    if yahoo != 1.0 and abs(lr - math.log(yahoo)) < _ENCAJA:
+        return yahoo
+    if abs(lr) < _MISMO_PRECIO:
+        return 1.0
+    candidatos = [float(k) for k in SPLITS_PLAUSIBLES] + [1.0 / k for k in SPLITS_PLAUSIBLES]
+    k = min(candidatos, key=lambda k: abs(lr - math.log(k)))
+    return k if abs(lr - math.log(k)) < _ENCAJA else None
+
+
+def _deduce_splits(puntos):
+    """
+    Los splits de un producto a partir de lo que dice el precio de cada movimiento:
+    'puntos' es [(fecha, factor)], con el factor que lleva cada uno hasta hoy. Devuelve
+    [(proporción, desde, hasta)]: el split pasó después del último movimiento 'desde' con
+    las participaciones de antes y no más tarde del primero 'hasta' con las de después
+    (None si no hay ninguno después).
+
+    Los de factor 1 no dicen nada de cuándo fue el split (pueden ser de después o estar
+    corregidos a mano), así que solo marcan el final. Si un factor vuelve a salir más
+    tarde, lo de en medio no cuenta para las fechas (el movimiento ya va con su propio factor).
+    """
+    puntos = sorted(puntos)
+    tramos = []                     # [[factor, última fecha]], en orden
+    for f, k in puntos:
+        if k == 1.0:
+            continue
+        for i, t in enumerate(tramos):
+            if t[0] == k:           # vuelve un factor anterior: se junta con él
+                del tramos[i + 1:]
+                t[1] = f
+                break
+        else:
+            tramos.append([k, f])
+    out = []
+    for i, (k, ultima) in enumerate(tramos):
+        siguiente = tramos[i + 1][0] if i + 1 < len(tramos) else 1.0
+        if i + 1 < len(tramos):     # el primero del tramo siguiente
+            hasta = next((f for f, kk in puntos if f > ultima and kk == siguiente), None)
+        else:
+            hasta = None
+        # Si no, el primero de después, sea cual sea.
+        hasta = hasta or next((f for f, _ in puntos if f > ultima), None)
+        out.append((k / siguiente, ultima, hasta))
+    return out
+
+
+def _junta_splits(deducidos, yahoo):
+    """
+    Los splits deducidos del precio con los que da Yahoo: si en la ventana de uno deducido
+    hay splits de Yahoo que suman lo mismo, se toman sus fechas (son las de verdad). Los de
+    Yahoo de dentro de una ventana que no cuadran se dejan (manda el precio de tus
+    movimientos) y los de fuera de todas se añaden tal cual.
+    Devuelve ({fecha: proporción}, {fecha de un split deducido: (desde, hasta)}).
+    """
+    splits, ventanas, usados = {}, {}, set()
+    for r, desde, hasta in deducidos:
+        dentro = {f: v for f, v in yahoo.items() if f > desde and (hasta is None or f <= hasta)}
+        usados.update(dentro)
+        if dentro and abs(math.log(math.prod(dentro.values()) / r)) < 1e-6:
+            splits.update(dentro)
+            continue
+        fecha = hasta or (d(desde) + dt.timedelta(days=1)).isoformat()
+        splits[fecha] = splits.get(fecha, 1.0) * r
+        ventanas[fecha] = (desde, hasta)
+    splits.update({f: v for f, v in yahoo.items() if f not in usados})
+    return splits, ventanas
+
+
+def ajusta_splits(movimientos, productos, cache=None, hasta=None):
+    """
+    Yahoo da los precios ajustados hacia atrás a cada split, pero los movimientos guardan
+    las participaciones que dio el broker ese día. Aquí se pasan a participaciones de
+    después del split, sin tocar los movimientos originales: devuelve copias de los que
+    cambian. Con 'hasta', las participaciones son las que había ese día (se deshacen los
+    splits que aún no habían pasado), como las diría el broker entonces.
+
+    Yahoo no siempre manda el split (SPYI.DE no lo trae) aunque sí da los cierres de antes
+    ajustados, así que el split se deduce de tus propios movimientos:
+
+    - En cada compra, venta o traspaso con importe y participaciones se compara su precio
+      (importe / participaciones, en euros) con el cierre de ese día (o el último anterior;
+      si no hay, el primero después) pasado a euros con el cambio guardado de ese día.
+    - Si salen a menos de 1,5 veces (o más de 1/1,5) el cierre, es el mismo precio: el
+      cambio, las comisiones y la horquilla nunca lo mueven tanto. No se toca.
+    - Si no, se busca la proporción de split plausible más cercana (2, 3, 4, 5, 8, 10, 15,
+      20, 25, 30, 40, 50 o 100 por 1, o al revés) y se da por buena si está a menos de un
+      10 %; también vale lo que digan los splits de Yahoo posteriores a esa fecha. Las
+      participaciones se multiplican por ella. Las que ya corregiste a mano salen a 1 y no
+      se ajustan otra vez.
+    - Si no encaja con ninguna, no se toca y se avisa: seguramente hay una errata en las
+      participaciones o en el importe.
+
+    Con esos factores se sacan los splits del producto: cada uno pasó entre el último
+    movimiento con las participaciones de antes y el primero con las de después, y se le
+    pone la fecha de este (o el día siguiente al último, si no hay ninguno después). Si
+    Yahoo da un split que encaja en esa ventana, se usa su fecha. Con esos splits se pasan
+    los movimientos sin precio (un ajuste, un traspaso sin importe) y se deshacen los
+    posteriores a 'hasta'.
+
+    Límites: sin cierres guardados del producto no se deduce nada (solo cuentan los splits
+    de Yahoo, y se supone que todo va en participaciones del broker). Sin el cambio guardado,
+    un producto en otra moneda se compara en su moneda y solo se reconoce el mismo precio.
+    La fecha deducida es aproximada (la del primer movimiento de después): con 'hasta'
+    entre el split de verdad y ese movimiento salen las participaciones de antes. Dos
+    splits seguidos sin movimientos entre ellos cuentan como uno; si su producto no está en
+    la lista (2 y 3 dan 6), solo se reconoce con los splits de Yahoo.
+
+    Devuelve (movimientos, {producto: {"movimientos": n ajustados, "splits": {fecha: proporción},
+    "deducidos": {fecha: (desde, hasta)}, "raros": [movimientos cuyo precio no cuadra]}}).
+    """
+    movimientos = list(movimientos)
+    yahoo = {p["id"]: p for p in productos if p.get("fuente") == "yahoo" and p.get("codigo")}
+    if not yahoo:
+        return movimientos, {}
+    datos = {}
+
+    def de(pid):
+        """Cierres, cambio y splits de Yahoo de un producto (se leen una vez)."""
+        if pid not in datos:
+            p = yahoo[pid]
+            c = lee_cache(_base_cache(p["codigo"], cache) + ".json")
+            sim, factor = simbolo_fx(p.get("moneda"))
+            fx = lee_cache(_base_cache(sim, cache) + ".json") if sim else {}
+            s = {f: float(r) for f, r in splits_de(p["codigo"], cache).items() if r and float(r) > 0}
+            datos[pid] = {"cierres": c, "fechas": sorted(c), "factor": factor, "fx": fx, "fx_fechas": sorted(fx),
+                          "crudo": bool(sim) and not fx, "yahoo": s}
+        return datos[pid]
+
+    def precio(m, pid, unidades):
+        """(factor, implícito, cierre en euros) según el precio del movimiento; factor None si
+        no cuadra. None si no hay precio que comparar."""
+        if m.get("tipo") not in _CON_PRECIO or unidades <= 0:
+            return None
+        try:
+            imp = float(m.get("importe") or 0)
+        except (TypeError, ValueError):
+            return None
+        x = de(pid)
+        cierre = _cierre_cercano(x["cierres"], x["fechas"], m["fecha"])
+        if imp <= 0 or not cierre or cierre <= 0:
+            return None
+        cierre *= x["factor"]
+        if x["fx"]:
+            cambio = _cierre_cercano(x["fx"], x["fx_fechas"], m["fecha"])
+            if not cambio or cambio <= 0:
+                return None
+            cierre *= cambio
+        implicito = imp / unidades
+        r = implicito / cierre
+        if x["crudo"]:              # sin cambio: solo se reconoce el mismo precio
+            return (1.0, implicito, cierre) if abs(math.log(r)) < _MISMO_PRECIO else None
+        return _proporcion_split(r, _factor_splits(x["yahoo"], m["fecha"])), implicito, cierre
+
+    # 1. Las participaciones de cada movimiento en los productos de Yahoo, con lo que dice su precio.
+    trozos = []                     # [(índice, campo, producto, participaciones, precio o None)]
+    for i, m in enumerate(movimientos):
+        if m.get("tipo") in ("dividendo", "comision"):
+            continue
+        for campo, pid in (("unidades", m.get("producto")), ("unidadesDestino", m.get("destino"))):
+            if pid not in yahoo:
+                continue
+            try:
+                u = float(m.get(campo) or 0)
+            except (TypeError, ValueError):
+                continue
+            if u:
+                trozos.append((i, campo, pid, u, precio(m, pid, u)))
+
+    # 2. Los splits de cada producto: los deducidos de los precios y los de Yahoo.
+    puntos = defaultdict(list)
+    for i, _, pid, _, pr in trozos:
+        if pr and pr[0] is not None:
+            puntos[pid].append((movimientos[i]["fecha"], pr[0]))
+    splits = {pid: _junta_splits(_deduce_splits(puntos.get(pid, [])), de(pid)["yahoo"])
+              for pid in {t[2] for t in trozos}}
+
+    # 3. Las participaciones de después (o las de 'hasta').
+    cambios, resumen = defaultdict(dict), {}
+
+    def resumen_de(pid):
+        return resumen.setdefault(pid, {"movimientos": set(), "splits": {}, "deducidos": {}, "raros": []})
+
+    for i, campo, pid, u, pr in trozos:
+        m = movimientos[i]
+        s, ventanas = splits[pid]
+        if pr and pr[0] is None:    # no cuadra con ningún split: se deja como está
+            raros = resumen_de(pid)["raros"]
+            clave = m.get("id") or m.get("_tid") or id(m)
+            if all(r["clave"] != clave for r in raros):
+                raros.append({"clave": clave, "fecha": m["fecha"], "tipo": m.get("tipo"),
+                              "implicito": pr[1], "cierre": pr[2]})
+        factor = pr[0] if pr and pr[0] is not None else 1.0 if pr else _factor_splits(s, m["fecha"])
+        nuevas = u * factor
+        if hasta:
+            nuevas /= _factor_splits(s, hasta)
+        if abs(nuevas - u) <= 1e-12 * max(1.0, abs(u)):
+            continue
+        cambios[i][campo] = nuevas
+        r = resumen_de(pid)
+        # Un traspaso partido en salida y entrada es un solo movimiento.
+        r["movimientos"].add(m.get("id") or m.get("_tid") or id(m))
+        for f, v in s.items():
+            if f > m["fecha"] and (hasta is None or f <= hasta):
+                r["splits"][f] = v
+                if f in ventanas:
+                    r["deducidos"][f] = ventanas[f]
+
+    for r in resumen.values():
+        r["movimientos"] = len(r["movimientos"])
+    out = [{**m, **cambios[i]} if i in cambios else m for i, m in enumerate(movimientos)]
+    return out, resumen
+
+
+def fmt_split(r):
+    """25.0 -> «25 por 1»; 0.1 -> «1 por 10»."""
+    def n(x):
+        return f"{round(x, 4):g}".replace(".", ",")
+    return f"{n(r)} por 1" if r >= 1 else f"1 por {n(1 / r)}"
+
+
+def avisa_splits(resumen, productos):
+    """Un aviso por producto con movimientos pasados a participaciones de después de un split
+    (diciendo si el split lo da Yahoo o se deduce del precio), y otro por cada movimiento cuyo
+    precio no cuadra con el de mercado."""
+    nombre = {p["id"]: p.get("corto") or p.get("nombre") or p["id"] for p in productos}
+
+    def precio(x):
+        return f"{x:,.2f}".replace(",", " ").replace(".", ",").replace(" ", ".")
+
+    for pid, r in resumen.items():
+        nom = nombre.get(pid, pid)
+        n = r["movimientos"]
+        if n:
+            deducidos = r.get("deducidos", {})
+            partes = []
+            de_yahoo = sorted((f, v) for f, v in r["splits"].items() if f not in deducidos)
+            if de_yahoo:
+                partes.append("split " + " y ".join(f"de {fmt_split(v)} el {fmt_fecha_es(f)}" for f, v in de_yahoo))
+            for f, v in sorted((f, v) for f, v in r["splits"].items() if f in deducidos):
+                desde, hasta = deducidos[f]
+                cuando = (f"entre el {fmt_fecha_es(desde)} y el {fmt_fecha_es(hasta)}" if hasta
+                          else f"después del {fmt_fecha_es(desde)}")
+                partes.append(f"deduzco un split de {fmt_split(v)} {cuando} por el precio de tus compras")
+            aviso(f"{nom}: {'; '.join(partes) or 'hay un split'}; cuento en participaciones de después del "
+                  f"split {n} movimiento{'s' if n != 1 else ''} anterior{'es' if n != 1 else ''}.")
+        for x in r.get("raros", []):
+            tipo = {"compra": "la compra", "venta": "la venta"}.get(x["tipo"], "el traspaso")
+            aviso(f"{nom}: el precio de {tipo} del {fmt_fecha_es(x['fecha'])} ({precio(x['implicito'])} € por "
+                  f"participación) no cuadra con el de mercado ese día ({precio(x['cierre'])} €). Seguramente hay "
+                  "una errata en las participaciones o en el importe: revísalo.")
+
+
 def _saca_fifo(lotes, unidades):
     """Saca 'unidades' de los lotes, primero los más antiguos. Devuelve (trozos, lo que faltaba).
     Cada trozo es [unidades, coste, ref, fecha de compra]."""
@@ -745,13 +1093,17 @@ def aplicar_todos(productos, movs_por, valor_a_mano=None, conservar_lotes=False,
     return est
 
 
-def lotes_vivos(cfg, pid, fecha):
+def lotes_vivos(cfg, pid, fecha, cache=None):
     """Lotes que quedan de un producto al final de 'fecha' (FIFO, con los traspasos):
-    [[unidades, coste, ref, fecha de compra]], del más antiguo al más nuevo."""
+    [[unidades, coste, ref, fecha de compra]], del más antiguo al más nuevo. Las unidades
+    son las de ese día (con los splits que ya habían pasado, ver ajusta_splits). Los splits
+    se deducen con todos los movimientos, también los de después de 'fecha'."""
     productos = [p for p in cfg.get("productos", []) if p.get("tipo") not in ("efectivo", "deuda")]
     movs_por = defaultdict(list)
-    for m in expande_traspasos(m for m in cfg.get("movimientos", []) if m.get("fecha", "") <= fecha):
-        movs_por[m.get("producto")].append(m)
+    movs, _ = ajusta_splits(expande_traspasos(cfg.get("movimientos", [])), productos, cache, hasta=fecha)
+    for m in movs:
+        if m.get("fecha", "") <= fecha:
+            movs_por[m.get("producto")].append(m)
     est = aplicar_todos(productos, movs_por, conservar_lotes=True)
     return [l for l in (est.get(pid) or {}).get("lotes", []) if l[0] > 1e-9 or l[1] > 1e-9]
 
@@ -916,13 +1268,20 @@ def serie_cambio(moneda, carpeta, fresca=False):
 
 # ---------------------------------------------------------------- construccion
 
-def fifo_cartera(cfg, productos_cfg=None):
+def fifo_cartera(cfg, productos_cfg=None, cache=None, splits=None):
     """FIFO de todos los productos a la vez (los traspasos pasan lotes de uno a otro).
-    Devuelve (resultado de aplicar_todos, movimientos por producto, valores anotados por producto)."""
+    Devuelve (resultado de aplicar_todos, movimientos por producto, valores anotados por producto).
+    Los movimientos van con las participaciones de después de los splits (ver ajusta_splits);
+    si se pasa el diccionario 'splits', se llena con lo que se ha ajustado de cada producto."""
     if productos_cfg is None:
         productos_cfg = cfg.get("productos", [])
     movs_por, vals_por = defaultdict(list), defaultdict(list)
-    for m in expande_traspasos(cfg.get("movimientos", [])):
+    # Las mismas copias para aplicar_todos y para quien las use después: id(m) identifica
+    # cada compra en los lotes y en "vendidas".
+    movs, ajustados = ajusta_splits(expande_traspasos(cfg.get("movimientos", [])), productos_cfg, cache)
+    if splits is not None:
+        splits.update(ajustados)
+    for m in movs:
         movs_por[m.get("producto")].append(m)
     for v in cfg.get("valoraciones", []):
         vals_por[v.get("producto")].append(v)
@@ -966,7 +1325,9 @@ def construir(cfg, carpeta, descargar=True, cache=None, historico=True):
             if sim not in series:
                 series[sim] = descargar_serie(sim)
 
-    movimientos_de, movs_por, vals_por = fifo_cartera(cfg, productos_cfg)
+    ajustados = {}
+    movimientos_de, movs_por, vals_por = fifo_cartera(cfg, productos_cfg, splits=ajustados)
+    avisa_splits(ajustados, productos_cfg)
 
     # Fecha de valoracion: el ultimo precio o valor anotado que haya, sin pasar de hoy.
     ultimas = [v["fecha"] for v in cfg.get("valoraciones", [])]

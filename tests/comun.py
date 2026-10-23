@@ -143,6 +143,19 @@ def mov(fecha, producto, tipo, unidades, importe, mid=None, **extra):
             "importe": importe, **extra}
 
 
+def guarda_cache_yahoo(carpeta, simbolo, serie=None, splits=None):
+    """Deja en <carpeta>/cache lo que guardaría Yahoo de un símbolo: sus cierres (ya ajustados
+    a los splits) y sus splits ({fecha: proporción}). Devuelve la carpeta de la cache."""
+    cache = os.path.join(carpeta, "cache")
+    os.makedirs(cache, exist_ok=True)
+    base = motor._base_cache(simbolo, cache)
+    for ext, datos in ((".json", serie), (".splits.json", splits)):
+        if datos is not None:
+            with open(base + ext, "w", encoding="utf-8") as f:
+                json.dump(datos, f)
+    return cache
+
+
 def lee_demo():
     with open(os.path.join(RAIZ, "demo", "cartera.json"), encoding="utf-8") as f:
         return json.load(f)

@@ -68,11 +68,12 @@ def ano_por_defecto(anos, hoy=None):
     return cerrados[0] if cerrados else (anos[0] if anos else actual)
 
 
-def informe(cfg, ano=None, hoy=None):
+def informe(cfg, ano=None, hoy=None, cache=None):
+    """'cache': la carpeta de precios de Yahoo, de la que salen los splits (por defecto, la del motor)."""
     anos = anos_con_datos(cfg)
     ano = str(ano) if ano else ano_por_defecto(anos, hoy)
     productos = {p["id"]: p for p in cfg.get("productos", [])}
-    est, _, _ = motor.fifo_cartera(cfg)
+    est, _, _ = motor.fifo_cartera(cfg, cache=cache)
     movs = cfg.get("movimientos", [])
     avisos = []
 
